@@ -11,9 +11,8 @@ use tokio::time::sleep;
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    // Validate required env vars up front instead of failing silently later
     let server_url = std::env::var("SERVER_URL").context(
-        "SERVER_URL must be set in .env (e.g., https://api.ram-service-excellence.com/api/upload)",
+        "SERVER_URL must be set in .env (e.g., https://etl.ram-service-excellence.com/api/upload)",
     )?;
     let secret_token = std::env::var("SECRET_TOKEN")
         .context("SECRET_TOKEN must be set in .env to match server UPLOAD_SECRET_TOKEN")?;
@@ -32,14 +31,12 @@ async fn main() -> Result<()> {
 
     watcher.watch(&download_dir, RecursiveMode::NonRecursive)?;
 
-    // Build client with clean User-Agent & timeout suited for Netskope -> Cloudflare
     let http_client = Client::builder()
         .user_agent("sf-watcher/0.1.0 (macOS)")
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(90))
         .build()?;
 
-    // Track recently processed files to avoid duplicate uploads from FSEvents bursts
     let mut recent_uploads: HashMap<PathBuf, Instant> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
@@ -51,11 +48,10 @@ async fn main() -> Result<()> {
         }
 
         for path in event.paths {
-            if !is_target_salesforce_file(&path) {
+            if !is_target_file(&path) {
                 continue;
             }
 
-            // Skip if we already handled this exact file within the last 10 seconds
             if let Some(last_seen) = recent_uploads.get(&path) {
                 if last_seen.elapsed() < Duration::from_secs(10) {
                     continue;
@@ -71,7 +67,6 @@ async fn main() -> Result<()> {
             // Give the browser 2 seconds to release the file lock and finish writing
             sleep(Duration::from_secs(2)).await;
 
-            // Re-verify the file still exists after debounce (e.g., wasn't a transient temp file)
             if !path.is_file() {
                 continue;
             }
@@ -92,8 +87,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Filter for Salesforce exports matching the server's ingestion rules
-fn is_target_salesforce_file(path: &Path) -> bool {
+/// Filter for Salesforce Excel exports and contract PDFs matching server tunnels.rs
+fn is_target_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -101,15 +96,25 @@ fn is_target_salesforce_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .map_or(false, |name| {
-            !name.starts_with("~$")
-                && !name.starts_with('.')
-                && name.ends_with(".xlsx")
+            if name.starts_with("~$") || name.starts_with('.') {
+                return false;
+            }
+
+            let is_salesforce_xlsx = name.ends_with(".xlsx")
                 && (name.starts_with("Case Basic Details Database")
                     || name.starts_with("Case Emails Database")
                     || name.starts_with("Case Comments Database")
                     || name.starts_with("Case Operator Details Database")
                     || name.starts_with("Case Customer Details Database")
-                    || name.starts_with("Case History Database"))
+                    || name.starts_with("Case History Database"));
+
+            let is_pdf = name.ends_with(".pdf")
+                && (name.starts_with("重要事項説明書")
+                    || name.starts_with("全保連保証委託契約書")
+                    || name.starts_with("GTN保証委託契約書")
+                    || name.starts_with("賃貸借契約書"));
+
+            is_salesforce_xlsx || is_pdf
         })
 }
 
@@ -123,14 +128,22 @@ async fn upload_file(
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("unknown.xlsx")
+        .unwrap_or("unknown_file")
         .to_string();
+
+    let mime_type = if file_name.ends_with(".pdf") {
+        "application/pdf"
+    } else if file_name.ends_with(".xlsx") {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    } else {
+        "application/octet-stream"
+    };
 
     let file_bytes = tokio::fs::read(path).await.context("Failed to read file")?;
 
     let file_part = multipart::Part::bytes(file_bytes)
         .file_name(file_name)
-        .mime_str("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")?;
+        .mime_str(mime_type)?;
 
     let form = multipart::Form::new().part("file", file_part);
 
