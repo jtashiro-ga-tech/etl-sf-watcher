@@ -1,18 +1,42 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Installing Salesforce ETL Watcher..."
+echo "🚀 Installing Salesforce ETL Watcher (macOS)..."
 
 # Define paths dynamically based on the colleague's Home folder
 APP_DIR="$HOME/Library/Application Support/ETLWatcher"
 BIN_PATH="$APP_DIR/sf_watcher"
+ENV_PATH="$APP_DIR/.env"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.ram-service-excellence.etlwatcher.plist"
 LOG_DIR="$HOME/Library/Logs/ETLWatcher"
+
+DEFAULT_SERVER_URL="https://etl.ram-service-excellence.com/api/upload"
 
 # Create necessary directories
 mkdir -p "$APP_DIR"
 mkdir -p "$HOME/Library/LaunchAgents"
 mkdir -p "$LOG_DIR"
+
+# Handle the SECRET_TOKEN for the .env file
+INCOMING_TOKEN="${SECRET_TOKEN:-$1}"
+if [ -z "$INCOMING_TOKEN" ] && [ -f "$ENV_PATH" ]; then
+    # Extract existing token if updating
+    INCOMING_TOKEN=$(grep -E '^SECRET_TOKEN=' "$ENV_PATH" | head -n 1 | cut -d '=' -f2- | tr -d '"' | tr -d "'")
+fi
+
+if [ -z "$INCOMING_TOKEN" ]; then
+    echo "❌ Error: SECRET_TOKEN is required for new installations."
+    echo "Run: curl -fsSL https://github.com/jtashiro-ga-tech/etl-sf-watcher/raw/refs/heads/main/install.sh | SECRET_TOKEN=\"YOUR_TOKEN\" bash"
+    exit 1
+fi
+
+# Write .env file
+echo "🔐 Configuring environment variables..."
+cat << EOF > "$ENV_PATH"
+SERVER_URL="$DEFAULT_SERVER_URL"
+SECRET_TOKEN="$INCOMING_TOKEN"
+EOF
+chmod 600 "$ENV_PATH"
 
 # Download the compiled binary directly from GitHub
 echo "⬇️  Downloading background service..."
@@ -34,6 +58,8 @@ cat << EOF > "$PLIST_PATH"
     <array>
         <string>$BIN_PATH</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>$APP_DIR</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
