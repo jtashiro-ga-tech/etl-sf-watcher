@@ -5,17 +5,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let server_url = std::env::var("SERVER_URL").context(
-        "SERVER_URL must be set in .env (e.g., https://etl.ram-service-excellence.com/api/upload)",
-    )?;
-    let secret_token = std::env::var("SECRET_TOKEN")
-        .context("SECRET_TOKEN must be set in .env to match server UPLOAD_SECRET_TOKEN")?;
+    let server_url = std::env::var("SERVER_URL").context("SERVER_URL must be set in .env (e.g., https://etl.ram-service-excellence.com/api/upload)")?;
+    let secret_token = std::env::var("SECRET_TOKEN").context("SECRET_TOKEN must be set in .env to match server UPLOAD_SECRET_TOKEN")?;
 
     let download_dir = dirs::download_dir().context("Could not find Downloads directory")?;
     println!("👀 Watching directory: {:?}", download_dir);
@@ -31,19 +27,12 @@ async fn main() -> Result<()> {
 
     watcher.watch(&download_dir, RecursiveMode::NonRecursive)?;
 
-    let http_client = Client::builder()
-        .user_agent("sf-watcher/0.1.0 (macOS)")
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(90))
-        .build()?;
+    let http_client = Client::builder().user_agent("sf-watcher/0.1.0 (macOS)").connect_timeout(Duration::from_secs(15)).timeout(Duration::from_secs(90)).build()?;
 
     let mut recent_uploads: HashMap<PathBuf, Instant> = HashMap::new();
 
     while let Some(event) = rx.recv().await {
-        if !matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-        ) {
+        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))) {
             continue;
         }
 
@@ -59,28 +48,55 @@ async fn main() -> Result<()> {
             }
             recent_uploads.insert(path.clone(), Instant::now());
 
-            println!(
-                "📄 Detected new file: {:?}",
-                path.file_name().unwrap_or_default()
-            );
+            println!("📄 Detected new file: {:?}", path.file_name().unwrap_or_default());
 
-            // Give the browser 10 seconds to release the file lock and finish writing
-            sleep(Duration::from_secs(10)).await;
+            // Clone variables so we can process multiple files simultaneously
+            let http_client = http_client.clone();
+            let server_url = server_url.clone();
+            let secret_token = secret_token.clone();
+            let path_clone = path.clone();
 
-            if !path.is_file() {
-                continue;
-            }
-
-            match upload_file(&http_client, &server_url, &secret_token, &path).await {
-                Ok(_) => {
-                    println!("✅ Successfully uploaded to server.");
-                    // Optional: Delete the file locally after successful upload
-                    let _ = tokio::fs::remove_file(&path).await;
+            tokio::spawn(async move {
+                // Wait for the file size to stabilize (ensures the browser is 100% finished writing)
+                let mut last_size = 0;
+                let mut stable_count = 0;
+                for _ in 0..60 {
+                    // Timeout after 60 seconds
+                    if let Ok(meta) = tokio::fs::metadata(&path_clone).await {
+                        let current_size = meta.len();
+                        if current_size > 0 && current_size == last_size {
+                            stable_count += 1;
+                            if stable_count >= 2 {
+                                break; // File size hasn't changed for 2 checks; it's fully downloaded
+                            }
+                        } else {
+                            last_size = current_size;
+                            stable_count = 0;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
-                Err(e) => {
-                    eprintln!("❌ Failed to upload file: {:?}", e);
+
+                if !path_clone.is_file() {
+                    return;
                 }
-            }
+
+                match upload_file(&http_client, &server_url, &secret_token, &path_clone).await {
+                    Ok(_) => {
+                        println!("✅ Successfully uploaded {:?}", path_clone.file_name().unwrap_or_default());
+
+                        // Attempt to delete and explicitly print any errors if it fails
+                        if let Err(e) = tokio::fs::remove_file(&path_clone).await {
+                            eprintln!("❌ Could not delete local file: {}", e);
+                        } else {
+                            println!("🗑️ Deleted local file successfully.");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Failed to upload file: {:?}", e);
+                    }
+                }
+            });
         }
     }
 
@@ -93,43 +109,28 @@ fn is_target_file(path: &Path) -> bool {
         return false;
     }
 
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map_or(false, |name| {
-            if name.starts_with("~$") || name.starts_with('.') {
-                return false;
-            }
+    path.file_name().and_then(|n| n.to_str()).map_or(false, |name| {
+        if name.starts_with("~$") || name.starts_with('.') {
+            return false;
+        }
 
-            let is_salesforce_xlsx = name.ends_with(".xlsx")
-                && (name.starts_with("Case Basic Details Database")
-                    || name.starts_with("Case Emails Database")
-                    || name.starts_with("Case Comments Database")
-                    || name.starts_with("Case Operator Details Database")
-                    || name.starts_with("Case Customer Details Database")
-                    || name.starts_with("Case History Database"));
+        let is_salesforce_xlsx = name.ends_with(".xlsx")
+            && (name.starts_with("Case Basic Details Database")
+                || name.starts_with("Case Emails Database")
+                || name.starts_with("Case Comments Database")
+                || name.starts_with("Case Operator Details Database")
+                || name.starts_with("Case Customer Details Database")
+                || name.starts_with("Case History Database"));
 
-            let is_pdf = name.ends_with(".pdf")
-                && (name.starts_with("重要事項説明書")
-                    || name.starts_with("全保連保証委託契約書")
-                    || name.starts_with("GTN保証委託契約書")
-                    || name.starts_with("賃貸借契約書"));
+        let is_pdf = name.ends_with(".pdf") && (name.starts_with("重要事項説明書") || name.starts_with("全保連保証委託契約書") || name.starts_with("GTN保証委託契約書") || name.starts_with("賃貸借契約書"));
 
-            is_salesforce_xlsx || is_pdf
-        })
+        is_salesforce_xlsx || is_pdf
+    })
 }
 
 /// Securely POST the file to the Cloudflare Tunnel endpoint using multipart/form-data
-async fn upload_file(
-    client: &Client,
-    server_url: &str,
-    secret_token: &str,
-    path: &Path,
-) -> Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown_file")
-        .to_string();
+async fn upload_file(client: &Client, server_url: &str, secret_token: &str, path: &Path) -> Result<()> {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown_file").to_string();
 
     let mime_type = if file_name.ends_with(".pdf") {
         "application/pdf"
@@ -141,9 +142,7 @@ async fn upload_file(
 
     let file_bytes = tokio::fs::read(path).await.context("Failed to read file")?;
 
-    let file_part = multipart::Part::bytes(file_bytes)
-        .file_name(file_name)
-        .mime_str(mime_type)?;
+    let file_part = multipart::Part::bytes(file_bytes).file_name(file_name).mime_str(mime_type)?;
 
     let form = multipart::Form::new().part("file", file_part);
 
@@ -164,10 +163,6 @@ async fn upload_file(
     } else {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        Err(anyhow::anyhow!(
-            "Server returned {}: {}",
-            status,
-            error_text
-        ))
+        Err(anyhow::anyhow!("Server returned {}: {}", status, error_text))
     }
 }
