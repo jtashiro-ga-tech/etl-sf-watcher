@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
                 Ok(_) => {
                     println!("✅ Successfully uploaded to server.");
                     // Optional: Delete the file locally after successful upload
-                    // let _ = tokio::fs::remove_file(&path).await;
+                    let _ = tokio::fs::remove_file(&path).await;
                 }
                 Err(e) => {
                     eprintln!("❌ Failed to upload file: {:?}", e);
