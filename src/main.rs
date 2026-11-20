@@ -64,8 +64,8 @@ async fn main() -> Result<()> {
                 path.file_name().unwrap_or_default()
             );
 
-            // Give the browser 2 seconds to release the file lock and finish writing
-            sleep(Duration::from_secs(2)).await;
+            // Give the browser 10 seconds to release the file lock and finish writing
+            sleep(Duration::from_secs(10)).await;
 
             if !path.is_file() {
                 continue;
